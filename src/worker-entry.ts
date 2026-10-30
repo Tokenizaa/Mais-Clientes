@@ -493,13 +493,13 @@ function buildBrowserlessScrapeCode(): string {
 }
 
 async function updateJobSupabase(env: Env, userId: string, jobId: string, updates: any): Promise<void> {
-  const { error } = await supabaseFetch(env, 'PATCH', \`searches?id=eq.\${encodeURIComponent(jobId)}&user_id=eq.\${encodeURIComponent(userId)}\`, updates);
-  if (error) throw new Error(\`Falha ao atualizar job \${jobId}: \${error.message}\`);
+  const { error } = await supabaseFetch(env, 'PATCH', `searches?id=eq.${encodeURIComponent(jobId)}&user_id=eq.${encodeURIComponent(userId)}`, updates);
+  if (error) throw new Error(`Falha ao atualizar job ${jobId}: ${error.message}`);
 }
 
 async function insertPlaceSupabase(env: Env, place: any): Promise<void> {
   const { error } = await supabaseFetch(env, 'POST', 'places', place);
-  if (error) throw new Error(\`Falha ao persistir estabelecimento: \${error.message}\`);
+  if (error) throw new Error(`Falha ao persistir estabelecimento: ${error.message}`);
 }
 
 async function executeScrapeJob(job: ScrapeQueueMessage, env: Env): Promise<void> {
