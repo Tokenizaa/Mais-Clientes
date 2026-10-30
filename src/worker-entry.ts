@@ -300,7 +300,17 @@ async function supabaseFetch(
       const text = await resp.text().catch(() => '');
       return { data: null, error: new Error(`HTTP ${resp.status}: ${text}`) };
     }
-    const data = await resp.json();
+    // O Supabase pode retornar 204 No Content (ex.: PATCH sem Prefer: return=representation).
+    // Evitar falhar ao fazer resp.json() em body vazio.
+    let data: any = null;
+    const text = await resp.text().catch(() => '');
+    if (text.trim().length > 0) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = null;
+      }
+    }
     if (opts?.single && Array.isArray(data)) {
       return { data: data.length > 0 ? data[0] : null, error: null };
     }
@@ -510,7 +520,10 @@ async function executeScrapeJob(job: ScrapeQueueMessage, env: Env): Promise<void
     if (!token) throw new Error('BROWSERLESS_TOKEN não configurado como secret no Cloudflare.');
     await setJobStatus({ status: 'running', current_step: 'Conectando ao Browserless via HTTPS...', status_message: 'Execução da coleta iniciada.' });
 
-    const endpoint = 'https://production-sfo.browserless.io/function?timeout=600000';
+    // O Browserless limita a sessão a 120.000 ms (2 min) neste plano.
+    // Manter abaixo desse teto e deixar margem para o AbortSignal.
+    const BROWSERLESS_TIMEOUT_MS = 115000;
+    const endpoint = 'https://production-sfo.browserless.io/function?timeout=' + BROWSERLESS_TIMEOUT_MS;
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -522,7 +535,7 @@ async function executeScrapeJob(job: ScrapeQueueMessage, env: Env): Promise<void
         code: buildBrowserlessScrapeCode(),
         context: { jobId, segment, location, limit },
       }),
-      signal: AbortSignal.timeout(610000),
+      signal: AbortSignal.timeout(BROWSERLESS_TIMEOUT_MS + 5000),
     });
 
     if (!response.ok) {
