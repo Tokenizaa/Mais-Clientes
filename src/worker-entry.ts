@@ -1069,7 +1069,6 @@ export default {
     // Expor variáveis de ambiente como globais (para acesso nos helpers)
     const adminPassword = env.ADMIN_SEED_PASSWORD ?? '';
     (globalThis as any).ADMIN_SEED_PASSWORD = adminPassword;
-    (globalThis as any).BROWSER_WS_ENDPOINT = env.BROWSER_WS_ENDPOINT ?? '';
     (globalThis as any).PAYMENT_WEBHOOK_SECRET = env.PAYMENT_WEBHOOK_SECRET ?? '';
     (globalThis as any).SUPABASE_URL = env.SUPABASE_URL ?? '';
     (globalThis as any).SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? '';
