@@ -265,10 +265,10 @@ async function supabaseFetch(
   body?: any,
   opts?: { single?: boolean; profile?: string }
 ): Promise<{ data: any; error: any }> {
-  // globalThis é definido no início de cada requisição fetch.
-  // Usá-lo garante disponibilidade também em background (ctx.waitUntil).
-  const url = ((globalThis as any).SUPABASE_URL ?? env.SUPABASE_URL ?? '');
-  const key = ((globalThis as any).SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY ?? '');
+  // O objeto env é capturado explicitamente pelo waitUntil; não use globalThis
+  // para transportar credenciais entre requisições.
+  const url = env.SUPABASE_URL ?? '';
+  const key = env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY ?? '';
   if (!url || !key) {
     return { data: null, error: new Error('Supabase não configurado') };
   }
@@ -422,11 +422,13 @@ async function connectScrapeBrowser(wsEndpoint: string): Promise<Browser> {
 }
 
 async function updateJobSupabase(env: Env, userId: string, jobId: string, updates: any): Promise<void> {
-  await supabaseFetch(env, 'PATCH', `searches?id=eq.${encodeURIComponent(jobId)}&user_id=eq.${encodeURIComponent(userId)}`, updates);
+  const { error } = await supabaseFetch(env, 'PATCH', `searches?id=eq.${encodeURIComponent(jobId)}&user_id=eq.${encodeURIComponent(userId)}`, updates);
+  if (error) throw new Error(`Falha ao atualizar job ${jobId}: ${error.message}`);
 }
 
 async function insertPlaceSupabase(env: Env, place: any): Promise<void> {
-  await supabaseFetch(env, 'POST', 'places', place);
+  const { error } = await supabaseFetch(env, 'POST', 'places', place);
+  if (error) throw new Error(`Falha ao persistir estabelecimento: ${error.message}`);
 }
 
 async function executeScrapeJob(
@@ -435,7 +437,8 @@ async function executeScrapeJob(
   location: string,
   limit: number,
   userId: string,
-  wsEndpoint: string
+  wsEndpoint: string,
+  env: Env
 ) {
   let activeBrowser: Browser | null = null;
 
@@ -457,7 +460,7 @@ async function executeScrapeJob(
 
     await setJobStatus({ status: 'running', current_step: 'Conectando ao navegador...' });
 
-    activeBrowser = await connectScrapeBrowser(env);
+    activeBrowser = await connectScrapeBrowser(wsEndpoint);
     const searchPage = await activeBrowser.newPage();
     await searchPage.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -787,8 +790,8 @@ async function handleJobs(req: Request, url: URL, env: Env, ctx: ExecutionContex
           created_at: new Date().toISOString(),
         }, { single: true });
         if (!error && data) {
-          const wsEndpoint = (globalThis as any).BROWSER_WS_ENDPOINT ?? env.BROWSER_WS_ENDPOINT ?? '';
-          ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint));
+          const wsEndpoint = env.BROWSER_WS_ENDPOINT ?? '';
+          ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint, env));
           return jsonResponse({ data: { jobId, job: Array.isArray(data) ? data[0] : data }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
         }
       } catch {}
@@ -812,8 +815,8 @@ async function handleJobs(req: Request, url: URL, env: Env, ctx: ExecutionContex
       created_at: new Date().toISOString(),
     };
     memoryState.jobs.unshift(newJob);
-    const wsEndpoint = (globalThis as any).BROWSER_WS_ENDPOINT ?? env.BROWSER_WS_ENDPOINT ?? '';
-    ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint));
+    const wsEndpoint = env.BROWSER_WS_ENDPOINT ?? '';
+    ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint, env));
     return jsonResponse({ data: { jobId, job: newJob }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
   }
 
@@ -891,18 +894,17 @@ async function handleLeads(req: Request, url: URL, env: Env): Promise<Response> 
   return new Response('Not Found', { status: 404, statusText: 'Not Found' });
 }
 
-async function handleScraperSettings(req: Request, url: URL): Promise<Response> {
+async function handleScraperSettings(req: Request, url: URL, env: Env): Promise<Response> {
   const path = url.pathname;
   const method = req.method;
 
   if (path === '/api/v1/scraper/settings' && method === 'GET') {
-    const ws = (globalThis as any).BROWSER_WS_ENDPOINT || '';
+    const hasRemoteEndpoint = Boolean(env.BROWSER_WS_ENDPOINT);
     return jsonResponse({
-      engine: ws ? 'cloudflare_remote' : 'local_puppeteer',
-      browserWsEndpoint: ws,
-      hasRemoteEndpoint: Boolean(ws),
-      status: 'ready',
-      description: ws ? 'Conectado a Chromium remoto' : 'Utilizando Chromium Headless Local',
+      engine: hasRemoteEndpoint ? 'cloudflare_remote' : 'unconfigured',
+      hasRemoteEndpoint,
+      status: hasRemoteEndpoint ? 'configured' : 'unconfigured',
+      description: hasRemoteEndpoint ? 'Endpoint remoto configurado' : 'Mecanismo de navegador não configurado',
     });
   }
 
@@ -1084,7 +1086,7 @@ export default {
     if (path.startsWith('/api/auth/')) return handleAuth(request, url, env);
     if (path.startsWith('/api/v1/jobs')) return handleJobs(request, url, env, ctx);
     if (path.startsWith('/api/v1/leads')) return handleLeads(request, url, env);
-    if (path.startsWith('/api/v1/scraper/settings')) return handleScraperSettings(request, url);
+    if (path.startsWith('/api/v1/scraper/settings')) return handleScraperSettings(request, url, env);
     if (path.startsWith('/api/v1/billing')) return handleBilling(request, url, env);
     if (path.startsWith('/api/v1/webhooks/pagamento')) return handleBilling(request, url, env);
 
