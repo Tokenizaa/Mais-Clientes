@@ -19,7 +19,6 @@
 
 import { hashPassword, verifyPassword } from './server/auth-crypto';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { PlaceRecord, ScrapeJob } from './shared/types';
 import { extractPlaceDetails } from './server/scraper/extractor';
 import {
   cleanText, normalizeAddress, normalizePhone, normalizeWebsite, normalizeCategory,
