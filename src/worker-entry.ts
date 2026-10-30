@@ -561,7 +561,7 @@ async function executeScrapeJob(job: ScrapeQueueMessage, env: Env): Promise<void
       }
     }
 
-    const totalErrors = errors.length + persistenceErrors;
+    const totalErrors = errors.length + persistenceErrors + (places.length === 0 ? 1 : 0);
     const completed = collectedCount > 0 && totalErrors === 0;
     const partial = collectedCount > 0 && totalErrors > 0;
     await setJobStatus({
@@ -1083,7 +1083,7 @@ async function handleBilling(req: Request, url: URL, env: Env): Promise<Response
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    // Expor variáveis de ambiente como globais (para acesso nos helpers)
+    // O binding env é a fonte de configuração por requisição.
     const adminPassword = env.ADMIN_SEED_PASSWORD ?? '';
     (globalThis as any).ADMIN_SEED_PASSWORD = adminPassword;
 
