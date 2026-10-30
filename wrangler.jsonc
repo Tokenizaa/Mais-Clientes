@@ -9,7 +9,8 @@
   "vars": {
     "APP_URL": "https://mapscrape-pro.workers.dev",
     "NODE_ENV": "production",
-    "SUPABASE_URL": "https://ifkqrtjhdnolkuucgbpb.supabase.co"
+    "SUPABASE_URL": "https://ifkqrtjhdnolkuucgbpb.supabase.co",
+    "BROWSER_WS_ENDPOINT": ""
   },
 
   // Observabilidade

@@ -19,6 +19,9 @@
 
 import { hashPassword, verifyPassword } from './server/auth-crypto';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import puppeteer, { Browser, Page } from 'puppeteer';
+import { PlaceRecord, ScrapeJob } from './shared/types';
+import { extractPlaceDetails } from './server/scraper/extractor';
 
 // Tipos locais do Cloudflare Workers (evita conflitos com o build do frontend)
 interface ExecutionContext {
@@ -396,6 +399,217 @@ async function resolveUser(
 }
 
 // ============================================================================
+// Scraping real (adaptado do server.ts para Cloudflare Workers)
+// ============================================================================
+
+const activeScrapeJobs = new Map<string, { cancel: () => void }>();
+
+async function connectScrapeBrowser(env: Env): Promise<Browser> {
+  const wsEndpoint = (env.BROWSER_WS_ENDPOINT || '').trim();
+  if (wsEndpoint) {
+    try {
+      console.log(`[Scraper] Conectando ao Chromium remoto: ${wsEndpoint.replace(/:[^:]*@/, ':***@')}`);
+      return await puppeteer.connect({
+        browserWSEndpoint: wsEndpoint,
+        protocolTimeout: 45000,
+      });
+    } catch (err: any) {
+      console.warn(`[Scraper] Falha ao conectar ao Chromium remoto (${err?.message}).`);
+    }
+  }
+  throw new Error('BROWSER_WS_ENDPOINT não configurado. O scraping real requer Cloudflare Browser Rendering.');
+}
+
+async function updateJobSupabase(env: Env, userId: string, jobId: string, updates: any): Promise<void> {
+  await supabaseFetch(env, 'PATCH', `searches?id=eq.${encodeURIComponent(jobId)}&user_id=eq.${encodeURIComponent(userId)}`, updates);
+}
+
+async function insertPlaceSupabase(env: Env, place: any): Promise<void> {
+  await supabaseFetch(env, 'POST', 'places', place);
+}
+
+async function executeScrapeJob(
+  jobId: string,
+  segment: string,
+  location: string,
+  limit: number,
+  userId: string,
+  env: Env
+) {
+  let activeBrowser: Browser | null = null;
+
+  activeScrapeJobs.set(jobId, {
+    cancel: () => {
+      if (activeBrowser) {
+        activeBrowser.close().catch(() => {});
+      }
+    },
+  });
+
+  const setJobStatus = async (updates: any) => {
+    await updateJobSupabase(env, userId, jobId, updates);
+  };
+
+  try {
+    const searchQuery = `${segment} ${location}`.trim();
+    const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(searchQuery)}`;
+
+    await setJobStatus({ status: 'running', current_step: 'Conectando ao navegador...' });
+
+    activeBrowser = await connectScrapeBrowser(env);
+    const searchPage = await activeBrowser.newPage();
+    await searchPage.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+    await searchPage.setViewport({ width: 1280, height: 900 });
+    await searchPage.setExtraHTTPHeaders({
+      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    });
+
+    await setJobStatus({ current_step: `Navegando no Google Maps para: "${searchQuery}"...` });
+
+    await searchPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Handle Google consent banner
+    await searchPage.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button'));
+      const consentBtn = btns.find((b) =>
+        /aceitar|concordo|accept all|i agree/i.test(b.innerText || '')
+      );
+      if (consentBtn) consentBtn.click();
+    }).catch(() => {});
+
+    const placeUrls = new Set<string>();
+    let previousCount = 0;
+    let stagnantRounds = 0;
+
+    if (searchPage.url().includes('/maps/place/')) {
+      placeUrls.add(searchPage.url());
+    }
+
+    await setJobStatus({ current_step: 'Buscando fichas comerciais na página de resultados...' });
+
+    while (placeUrls.size < limit && stagnantRounds < 6) {
+      const links: string[] = await searchPage
+        .$$eval('a[href*="/maps/place/"]', (anchors) =>
+          anchors
+            .map((a) => (a as HTMLAnchorElement)?.href)
+            .filter((href): href is string => Boolean(href) && href.includes('/maps/place/'))
+        )
+        .catch(() => []);
+
+      for (const url of links) {
+        if (placeUrls.size >= limit) break;
+        placeUrls.add(url);
+      }
+
+      await setJobStatus({ total_found: placeUrls.size, current_step: `Identificados ${placeUrls.size} estabelecimentos...` });
+
+      if (placeUrls.size >= limit) break;
+
+      await searchPage.evaluate(() => {
+        const feed =
+          document.querySelector('div[role="feed"]') ||
+          document.querySelector('div.m6QErb[aria-label]') ||
+          document.querySelector('div.TFQHme');
+        if (feed) {
+          (feed as HTMLElement).scrollTop = feed.scrollHeight;
+        } else {
+          window.scrollTo(0, document.body.scrollHeight);
+        }
+      }).catch(() => {});
+
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      if (placeUrls.size === previousCount) {
+        stagnantRounds += 1;
+      } else {
+        stagnantRounds = 0;
+        previousCount = placeUrls.size;
+      }
+    }
+
+    await searchPage.close().catch(() => {});
+
+    if (placeUrls.size === 0) {
+      await setJobStatus({
+        status: 'failed',
+        status_message: 'Nenhum estabelecimento encontrado no Google Maps para esta busca.',
+        current_step: 'Sem resultados',
+        total_errors: 1,
+      });
+      return;
+    }
+
+    let collectedCount = 0;
+
+    for (const placeUrl of placeUrls) {
+      if (collectedCount >= limit) break;
+
+      let detailPage: Page | null = null;
+      try {
+        detailPage = await activeBrowser!.newPage();
+        await detailPage.setUserAgent(
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        );
+        await detailPage.setViewport({ width: 1280, height: 900 });
+        await detailPage.setExtraHTTPHeaders({
+          'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        });
+
+        await detailPage.goto(placeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+
+        const place = await extractPlaceDetails(detailPage, jobId, placeUrl);
+
+        if (!place.city && location.includes(',')) {
+          const parts = location.split(',');
+          place.city = parts[0].trim();
+          if (parts[1]) place.state = parts[1].trim();
+        } else if (!place.city) {
+          place.city = location;
+        }
+
+        await insertPlaceSupabase(env, place);
+        collectedCount += 1;
+
+        await setJobStatus({
+          total_collected: collectedCount,
+          current_step: `Coletado (${collectedCount}/${Math.min(limit, placeUrls.size)}): ${place.name || 'Estabelecimento'}`,
+        });
+      } catch (extractErr: any) {
+        console.error(`Erro ao coletar ficha ${placeUrl}:`, extractErr.message);
+      } finally {
+        if (detailPage) await detailPage.close().catch(() => {});
+      }
+    }
+
+    await setJobStatus({
+      status: collectedCount > 0 ? 'completed' : 'failed',
+      status_message:
+        collectedCount > 0
+          ? `Coleta concluída com sucesso! ${collectedCount} estabelecimentos extraídos.`
+          : 'Nenhum estabelecimento pôde ser extraído.',
+      current_step: collectedCount > 0 ? 'Concluído' : 'Falha',
+      completed_at: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    await setJobStatus({
+      status: 'failed',
+      status_message: `Erro durante a execução da coleta: ${error?.message || 'Falha desconhecida'}`,
+      current_step: 'Falha',
+      total_errors: 1,
+    });
+  } finally {
+    if (activeBrowser) {
+      await activeBrowser.close().catch(() => {});
+    }
+    activeScrapeJobs.delete(jobId);
+  }
+}
+
+// ============================================================================
 // Rotas da API
 // ============================================================================
 
@@ -572,6 +786,7 @@ async function handleJobs(req: Request, url: URL, env: Env): Promise<Response> {
           created_at: new Date().toISOString(),
         }, { single: true });
         if (!error && data) {
+          void executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, env);
           return jsonResponse({ data: { jobId, job: Array.isArray(data) ? data[0] : data }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
         }
       } catch {}
@@ -595,6 +810,7 @@ async function handleJobs(req: Request, url: URL, env: Env): Promise<Response> {
       created_at: new Date().toISOString(),
     };
     memoryState.jobs.unshift(newJob);
+    void executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, env);
     return jsonResponse({ data: { jobId, job: newJob }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
   }
 
