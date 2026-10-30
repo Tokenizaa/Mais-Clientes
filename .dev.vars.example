@@ -1,0 +1,24 @@
+# MapScrape Pro — Variáveis de ambiente para desenvolvimento local com Wrangler
+# Copie este arquivo para .dev.vars e preencha os valores reais.
+# Nunca commite o .dev.vars com valores de produção (está no .gitignore).
+
+# URL pública do app (usada para self-referential links, webhooks, etc.)
+APP_URL="https://mapscrape-pro.workers.dev"
+
+# Supabase (obrigatório para persistência no Worker)
+SUPABASE_URL="https://<seu-projeto>.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY="<sua-service-role-key>"
+
+# Cloudflare Browser Rendering (OBRIGATÓRIO no Workers — Puppeteer local não roda aqui)
+# Exemplo via Worker proxy: wss://cloudflare-browser-proxy.<sub>.workers.dev
+# Exemplo direto: wss://browser.cloudflare.com/v1/SEU_ACCOUNT_ID?token=SEU_TOKEN
+BROWSER_WS_ENDPOINT=""
+
+# Webhook de pagamentos (assinatura HMAC)
+PAYMENT_WEBHOOK_SECRET="<seu-secret-do-webhook>"
+
+# Gemini AI (opcional, para enriquecimento via IA)
+GEMINI_API_KEY="<sua-chave-gemini>"
+
+# Senha inicial do admin seed (opcional; se omitir, o admin exige redefinição de senha)
+ADMIN_SEED_PASSWORD=""

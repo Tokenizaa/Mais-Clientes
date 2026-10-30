@@ -1,0 +1,26 @@
+{
+  // Configuração do MapScrape Pro para Cloudflare Workers
+  "name": "mapscrape-pro",
+  "main": "src/worker-entry.ts",
+  "compatibility_date": "2026-10-29",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Variáveis de ambiente (definir segredos via `wrangler secret put`)
+  "vars": {
+    "APP_URL": "https://mapscrape-pro.workers.dev",
+    "NODE_ENV": "production",
+    "SUPABASE_URL": "https://ifkqrtjhdnolkuucgbpb.supabase.co"
+  },
+
+  // Observabilidade
+  "observability": {
+    "enabled": true
+  },
+
+  // Build do frontend (Vite) servido estaticamente pelo Worker
+  "assets": {
+    "directory": "dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  }
+}
