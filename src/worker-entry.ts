@@ -11,7 +11,7 @@
  *
  * Variáveis de ambiente obrigatórias (definir via wrangler secret put ou wrangler.jsonc):
  *   - SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY (para persistência real no Supabase)
- *   - BROWSER_WS_ENDPOINT (obrigatório para scraper real no Workers)
+ *   - BROWSERLESS_TOKEN (secret para Browserless HTTP) e Queue SCRAPE_QUEUE
  *   - PAYMENT_WEBHOOK_SECRET (webhooks de pagamento)
  *   - GEMINI_API_KEY (enriquecimento via Gemini)
  *   - ADMIN_SEED_PASSWORD (senha inicial do admin seed)
@@ -994,7 +994,7 @@ async function handleBilling(req: Request, url: URL, env: Env): Promise<Response
 
   // POST /api/v1/webhooks/pagamento
   if (path === '/api/v1/webhooks/pagamento' && method === 'POST') {
-    const secret = (globalThis as any).PAYMENT_WEBHOOK_SECRET || '';
+    const secret = env.PAYMENT_WEBHOOK_SECRET ?? '';
     if (!secret) return errorResponse('Webhook não configurado.', 503);
 
     const signature = req.headers.get('x-payment-signature');
