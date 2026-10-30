@@ -265,8 +265,10 @@ async function supabaseFetch(
   body?: any,
   opts?: { single?: boolean; profile?: string }
 ): Promise<{ data: any; error: any }> {
-  const url = env.SUPABASE_URL;
-  const key = env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY;
+  // globalThis é definido no início de cada requisição fetch.
+  // Usá-lo garante disponibilidade também em background (ctx.waitUntil).
+  const url = ((globalThis as any).SUPABASE_URL ?? env.SUPABASE_URL ?? '');
+  const key = ((globalThis as any).SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY ?? '');
   if (!url || !key) {
     return { data: null, error: new Error('Supabase não configurado') };
   }
@@ -404,8 +406,7 @@ async function resolveUser(
 
 const activeScrapeJobs = new Map<string, { cancel: () => void }>();
 
-async function connectScrapeBrowser(env: Env): Promise<Browser> {
-  const wsEndpoint = (env.BROWSER_WS_ENDPOINT || '').trim();
+async function connectScrapeBrowser(wsEndpoint: string): Promise<Browser> {
   if (wsEndpoint) {
     try {
       console.log(`[Scraper] Conectando ao Chromium remoto: ${wsEndpoint.replace(/:[^:]*@/, ':***@')}`);
@@ -434,7 +435,7 @@ async function executeScrapeJob(
   location: string,
   limit: number,
   userId: string,
-  env: Env
+  wsEndpoint: string
 ) {
   let activeBrowser: Browser | null = null;
 
@@ -732,7 +733,7 @@ async function handleAuth(req: Request, url: URL, env: Env): Promise<Response> {
   return new Response('Not Found', { status: 404, statusText: 'Not Found' });
 }
 
-async function handleJobs(req: Request, url: URL, env: Env): Promise<Response> {
+async function handleJobs(req: Request, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
   const path = url.pathname;
   const method = req.method;
   const token = extractBearerToken(req.headers);
@@ -786,7 +787,8 @@ async function handleJobs(req: Request, url: URL, env: Env): Promise<Response> {
           created_at: new Date().toISOString(),
         }, { single: true });
         if (!error && data) {
-          void executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, env);
+          const wsEndpoint = (globalThis as any).BROWSER_WS_ENDPOINT ?? env.BROWSER_WS_ENDPOINT ?? '';
+          ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint));
           return jsonResponse({ data: { jobId, job: Array.isArray(data) ? data[0] : data }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
         }
       } catch {}
@@ -810,7 +812,8 @@ async function handleJobs(req: Request, url: URL, env: Env): Promise<Response> {
       created_at: new Date().toISOString(),
     };
     memoryState.jobs.unshift(newJob);
-    void executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, env);
+    const wsEndpoint = (globalThis as any).BROWSER_WS_ENDPOINT ?? env.BROWSER_WS_ENDPOINT ?? '';
+    ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint));
     return jsonResponse({ data: { jobId, job: newJob }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
   }
 
@@ -1066,6 +1069,9 @@ export default {
     (globalThis as any).ADMIN_SEED_PASSWORD = adminPassword;
     (globalThis as any).BROWSER_WS_ENDPOINT = env.BROWSER_WS_ENDPOINT ?? '';
     (globalThis as any).PAYMENT_WEBHOOK_SECRET = env.PAYMENT_WEBHOOK_SECRET ?? '';
+    (globalThis as any).SUPABASE_URL = env.SUPABASE_URL ?? '';
+    (globalThis as any).SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+    (globalThis as any).SUPABASE_ANON_KEY = env.SUPABASE_ANON_KEY ?? '';
 
     // Garante seed e senha do admin a cada requisição (env só está disponível no fetch)
     ensureMemorySeed(adminPassword);
@@ -1076,7 +1082,7 @@ export default {
 
     // Rotas da API
     if (path.startsWith('/api/auth/')) return handleAuth(request, url, env);
-    if (path.startsWith('/api/v1/jobs')) return handleJobs(request, url, env);
+    if (path.startsWith('/api/v1/jobs')) return handleJobs(request, url, env, ctx);
     if (path.startsWith('/api/v1/leads')) return handleLeads(request, url, env);
     if (path.startsWith('/api/v1/scraper/settings')) return handleScraperSettings(request, url);
     if (path.startsWith('/api/v1/billing')) return handleBilling(request, url, env);

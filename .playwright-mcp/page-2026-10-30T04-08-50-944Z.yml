@@ -1,0 +1,23 @@
+- main [ref=f2e3]:
+  - generic [ref=f2e4]:
+    - generic [ref=f2e10]:
+      - paragraph [ref=f2e11]: MapScrape
+      - paragraph [ref=f2e12]: Plataforma de coleta e dados
+    - generic [ref=f2e13]:
+      - generic [ref=f2e14]:
+        - heading "Acesse sua conta" [level=1] [ref=f2e15]
+        - paragraph [ref=f2e16]: Entre para gerenciar projetos, pesquisas e resultados.
+      - generic [ref=f2e17]:
+        - generic [ref=f2e18]:
+          - text: E-mail
+          - textbox "E-mail" [ref=f2e19]:
+            - /placeholder: voce@empresa.com
+        - generic [ref=f2e20]:
+          - text: Senha
+          - textbox "Senha" [ref=f2e21]:
+            - /placeholder: Sua senha
+        - button "Entrar na plataforma" [ref=f2e22]
+      - generic [ref=f2e25]:
+        - text: Ainda não tem uma conta?
+        - button "Cadastre-se" [ref=f2e26]
+    - paragraph [ref=f2e27]: MapScrape · Acesso seguro à plataforma

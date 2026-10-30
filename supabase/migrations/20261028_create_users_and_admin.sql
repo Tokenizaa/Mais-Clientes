@@ -1,0 +1,8 @@
+-- DEPRECATED / intentionally no-op.
+-- MapScrape now uses the isolated mapscrape schema in the shared Supabase project.
+-- Do not create or modify tables in public here: public belongs to other products.
+-- The replacement migrations are:
+-- 20261029075252_create_mapscrape_schema.sql
+-- 20261029075604_create_mapscrape_tables.sql
+-- 20261029075633_secure_mapscrape_tables.sql
+-- 20261029080000_tighten_mapscrape_schema_privileges.sql

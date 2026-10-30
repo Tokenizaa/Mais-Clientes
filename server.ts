@@ -28,6 +28,8 @@ interface UserProfile {
   passwordHash: string;
   role: 'admin' | 'user';
   createdAt: string;
+  /** Quando true, o usuário deve redefinir a senha no próximo login (sem senha conhecida no código). */
+  requiresPasswordReset?: boolean;
 }
 
 interface ProjectRecord {
@@ -82,8 +84,30 @@ interface StoreState {
   settings?: ScraperSettings;
 }
 
+/**
+ * Hash de senha usando scrypt (work factor elevado) com salt aleatório por senha.
+ * Formato armazenado: `scrypt:<saltHex>:<hashHex>`.
+ * Não usar SHA-256 (vulnerável a rainbow table / brute force offline).
+ */
+const SCRYPT_KEYLEN = 64;
+
 function hashPassword(pass: string): string {
-  return crypto.createHash('sha256').update(pass + '_mapscrape_salt').digest('hex');
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(pass, salt, SCRYPT_KEYLEN);
+  return `scrypt:${salt.toString('hex')}:${derived.toString('hex')}`;
+}
+
+function verifyPassword(pass: string, stored: string): boolean {
+  try {
+    const parts = String(stored).split(':');
+    if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+    const salt = Buffer.from(parts[1], 'hex');
+    const expected = Buffer.from(parts[2], 'hex');
+    const derived = crypto.scryptSync(pass, salt, SCRYPT_KEYLEN);
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
 }
 
 function hashApiKey(key: string): string {
@@ -350,23 +374,31 @@ function getInitialStore(): StoreState {
 
   const initialPlaces = generateInitialPlaces(initialJobId, 'Clínica Médica', 'São Paulo - SP');
 
+  // Senhas iniciais NÃO são gravadas no código.
+  // A senha do admin seed pode ser definida via ADMIN_SEED_PASSWORD;
+  // caso contrário o usuário exige redefinição obrigatória (requiresPasswordReset).
+  const adminSeedPassword = process.env.ADMIN_SEED_PASSWORD ?? '';
+  const adminHash = adminSeedPassword ? hashPassword(adminSeedPassword) : '';
+
   return {
     users: [
       {
         id: initialUserId,
         email: 'olfnetto@gmail.com',
         name: 'Administrador Geral',
-        passwordHash: hashPassword('Netto@964212$'),
+        passwordHash: adminHash,
         role: 'admin',
         createdAt: new Date().toISOString(),
+        requiresPasswordReset: !adminHash,
       },
       {
         id: 'usr_admin_demo',
         email: 'admin@mapscrape.com',
         name: 'Equipe MapScrape',
-        passwordHash: hashPassword('admin12345678'),
+        passwordHash: '',
         role: 'admin',
         createdAt: new Date().toISOString(),
+        requiresPasswordReset: true,
       },
     ],
     jobs: [initialJob],
@@ -463,6 +495,17 @@ class Store {
 
 const store = new Store();
 
+// Tokens de sessão revogados (logout). Em produção persistir em Redis/DB com TTL.
+const revokedTokens = new Set<string>();
+
+function isTokenRevoked(token: string): boolean {
+  return revokedTokens.has(token);
+}
+
+function revokeToken(token: string): void {
+  revokedTokens.add(token);
+}
+
 // Helper: Extract Auth Bearer Token
 function extractBearerToken(req: Request): string | null {
   const auth = req.headers.authorization;
@@ -479,6 +522,11 @@ function resolveUserFromRequest(req: Request): UserProfile | null {
   const token = extractBearerToken(req);
   const state = store.getState();
 
+  // Token revogado (logout) => sessão inválida imediatamente.
+  if (token && isTokenRevoked(token)) {
+    return null;
+  }
+
   if (token) {
     // If token is an API key (starts with msk_ or matched by hash)
     const keyHash = hashApiKey(token);
@@ -494,8 +542,11 @@ function resolveUserFromRequest(req: Request): UserProfile | null {
       };
     }
 
-    // Check if token matches a registered user ID or JWT
-    const directUser = state.users.find((u) => u.id === token || `sess_${u.id}` === token);
+    // Check if token matches a registered user ID or JWT.
+    // Aceita tanto `sess_<userId>` (legado) quanto `sess_<userId>_<nonce>` (sessão única por login).
+    const directUser = state.users.find(
+      (u) => u.id === token || `sess_${u.id}` === token || token.startsWith(`sess_${u.id}_`)
+    );
     if (directUser) return directUser;
 
     // Check by email in token if formatted as email:id
@@ -505,9 +556,9 @@ function resolveUserFromRequest(req: Request): UserProfile | null {
     }
   }
 
-  // Fallback: Default to admin if in local dev
-  const admin = state.users.find((u) => u.role === 'admin') || state.users[0];
-  return admin || null;
+  // Sem fallback de autenticação: sem token válido => 401.
+  // Nunca retornar admin por default em nenhuma condição.
+  return null;
 }
 
 // =========================================================================
@@ -879,16 +930,23 @@ function buildCsvString(places: PlaceRecord[], fields: (keyof PlaceRecord)[]): s
   return '\uFEFF' + [headerRow, ...rows].join('\r\n');
 }
 
-async function startServer() {
+/**
+ * Cria e configura o aplicativo Express. Pode ser usado tanto pelo servidor
+ * local (startServer) quanto pelo Cloudflare Worker (worker-entry).
+ * Não inicia o servidor HTTP — apenas monta todas as rotas e middlewares.
+ */
+function createApp(opts?: { skipBodyParser?: boolean }): express.Application {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  if (!(opts?.skipBodyParser)) {
+    app.use(express.json({ limit: '50mb' }));
+    app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  }
 
   // Request logger for API calls
-  app.use((req, res, next) => {
-    if (req.path.startsWith('/api/')) {
+  app.use((req: any, res: any, next: any) => {
+    if (req.path?.startsWith('/api/')) {
       console.log(`[API ${req.method}] ${req.path}`);
     }
     next();
@@ -923,7 +981,8 @@ async function startServer() {
       state.users.push(newUser);
       store.persist();
 
-      const token = `sess_${newUser.id}`;
+      // Token único por sessão (nonce) para permitir logout/revogação individual.
+      const token = `sess_${newUser.id}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       return res.status(201).json({
         token,
         user: { id: newUser.id, email: newUser.email, name: newUser.name, role: newUser.role },
@@ -943,38 +1002,24 @@ async function startServer() {
       const state = store.getState();
       const user = state.users.find((u) => u.email.toLowerCase() === String(email).trim().toLowerCase());
 
-      // If user does not exist, auto-create admin or user if credentials match defaults
+      // Usuário não encontrado: 401 genérico (não revela se o e-mail existe).
+      // Nunca auto-provisionar contas no login.
       if (!user) {
-        // Auto-provision requested admin
-        const newUser: UserProfile = {
-          id: `usr_${Date.now()}`,
-          email: String(email).trim().toLowerCase(),
-          name: email.split('@')[0],
-          passwordHash: hashPassword(password),
-          role: email.toLowerCase().includes('admin') || email.toLowerCase() === 'olfnetto@gmail.com' ? 'admin' : 'user',
-          createdAt: new Date().toISOString(),
-        };
-        state.users.push(newUser);
-        store.persist();
-        const token = `sess_${newUser.id}`;
-        return res.json({
-          token,
-          user: { id: newUser.id, email: newUser.email, name: newUser.name, role: newUser.role },
-        });
+        return res.status(401).json({ error: 'E-mail ou senha inválidos.' });
       }
 
-      // Check password
-      const pHash = hashPassword(password);
-      if (user.passwordHash && user.passwordHash !== pHash) {
-        // For convenience in testing if default user
-        if (password === 'admin12345678' || password === 'Netto@964212$') {
-          // allow
-        } else {
-          return res.status(401).json({ error: 'Senha incorreta.' });
-        }
+      // Se não há hash armazenado (ex.: seed sem senha), exige redefinição.
+      if (!user.passwordHash) {
+        return res.status(401).json({ error: 'Senha não definida. Solicite redefinição de senha.' });
       }
 
-      const token = `sess_${user.id}`;
+      // Verificação de senha via scrypt (sem bypass, senhas default não funcionam).
+      if (!verifyPassword(password, user.passwordHash)) {
+        return res.status(401).json({ error: 'E-mail ou senha inválidos.' });
+      }
+
+      // Token único por sessão (nonce) para permitir logout/revogação individual.
+      const token = `sess_${user.id}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       return res.json({
         token,
         user: { id: user.id, email: user.email, name: user.name, role: user.role },
@@ -993,6 +1038,19 @@ async function startServer() {
       return res.json({
         user: { id: user.id, email: user.email, name: user.name, role: user.role },
       });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Logout: invalida o token de sessão server-side (blacklist em memória).
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    try {
+      const token = extractBearerToken(req);
+      if (token) {
+        revokeToken(token);
+      }
+      return res.json({ success: true, message: 'Sessão encerrada com sucesso.' });
     } catch (err: any) {
       return res.status(500).json({ error: err.message });
     }
@@ -1565,6 +1623,150 @@ async function startServer() {
   });
 
   // =========================================================================
+  // 9.5. PAGAMENTOS & BILLING (/api/v1/billing e /api/v1/webhooks)
+  // =========================================================================
+  // ESQUELETO P0-7.4: integração com gateway real (Stripe/VenoPag) pendente.
+  // Nenhuma credencial de produção é gravada no código; usar variáveis de ambiente.
+
+  interface BillingOrder {
+    id: string;
+    user_id: string;
+    amount: number; // centavos (BRL)
+    currency: string;
+    status: 'pending' | 'confirmed' | 'expired' | 'refunded' | 'failed';
+    idempotency_key?: string;
+    gateway_transaction_id?: string;
+    signature_payload?: string; // payload bruto recebido no webhook
+    created_at: string;
+    confirmed_at?: string;
+    fulfilled_at?: string;
+  }
+
+  const billingOrders: BillingOrder[] = [];
+
+  // Webhook secret configurado via env (nunca no código).
+  const PAYMENT_WEBHOOK_SECRET = process.env.PAYMENT_WEBHOOK_SECRET ?? '';
+
+  // Criar cobrança (esqueleto). Não processa pagamento real sem gateway configurado.
+  app.post('/api/v1/billing/checkout', (req: Request, res: Response) => {
+    try {
+      const user = resolveUserFromRequest(req);
+      if (!user) {
+        return res.status(401).json({ error: 'Autenticação obrigatória.' });
+      }
+
+      const { amount, idempotency_key } = req.body;
+      if (!amount || Number(amount) <= 0) {
+        return res.status(400).json({ error: 'Valor inválido.' });
+      }
+
+      // Idempotência: mesma chave => mesma cobrança
+      if (idempotency_key) {
+        const existing = billingOrders.find(
+          (o) => o.user_id === user.id && o.idempotency_key === idempotency_key
+        );
+        if (existing) {
+          return res.json({ order: existing });
+        }
+      }
+
+      const order: BillingOrder = {
+        id: `ord_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        user_id: user.id,
+        amount: Number(amount),
+        currency: 'BRL',
+        status: 'pending',
+        idempotency_key: idempotency_key ?? undefined,
+        created_at: new Date().toISOString(),
+      };
+
+      billingOrders.push(order);
+
+      // P0-7.4: liberação de conteúdo SOMENTE após webhook confirmado (status === 'confirmed').
+      // Este endpoint NÃO libera acesso ao produto.
+      return res.status(201).json({
+        order: { id: order.id, status: order.status, amount: order.amount, currency: order.currency },
+        message: 'Cobrança criada. Aguarde confirmação do gateway via webhook.',
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Webhook de pagamento: verifica assinatura criptográfica antes de confirmar.
+  app.post('/api/v1/webhooks/pagamento', (req: Request, res: Response) => {
+    try {
+      const signature = req.headers['x-payment-signature'] as string | undefined;
+      const rawBody = req.body; // exige express.json + verificar body bruto para HMAC
+
+      if (!PAYMENT_WEBHOOK_SECRET) {
+        return res.status(503).json({ error: 'Webhook não configurado (PAYMENT_WEBHOOK_SECRET).' });
+      }
+
+      // P0-7.4: assinatura obrigatória. Sem gateway real configurado, rejeita.
+      if (!signature) {
+        return res.status(401).json({ error: 'Assinatura do webhook ausente.' });
+      }
+
+      // Validação de assinatura (HMAC-SHA256) — implementar com o algoritmo do gateway.
+      const expected = crypto
+        .createHmac('sha256', PAYMENT_WEBHOOK_SECRET)
+        .update(JSON.stringify(rawBody))
+        .digest('hex');
+
+      if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+        return res.status(401).json({ error: 'Assinatura inválida.' });
+      }
+
+      const { transaction_id, order_id, status } = req.body as {
+        transaction_id?: string;
+        order_id?: string;
+        status?: string;
+      };
+
+      const order = billingOrders.find((o) => o.id === order_id);
+      if (!order) {
+        return res.status(404).json({ error: 'Cobrança não encontrada.' });
+      }
+
+      // Idempotência do webhook: processar cada transaction_id uma vez.
+      if (order.gateway_transaction_id === transaction_id && order.status === 'confirmed') {
+        return res.json({ success: true, message: 'Já processado.' });
+      }
+
+      if (status === 'confirmed') {
+        order.status = 'confirmed';
+        order.gateway_transaction_id = transaction_id ?? order.id;
+        order.confirmed_at = new Date().toISOString();
+        order.signature_payload = JSON.stringify(rawBody);
+        // Liberação de produto só acontece AQUI (após confirmação confiável).
+      } else if (status === 'failed' || status === 'expired') {
+        order.status = status;
+      }
+
+      return res.json({ success: true, order: { id: order.id, status: order.status } });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Consultar status de uma cobrança (própria)
+  app.get('/api/v1/billing/order/:id', (req: Request, res: Response) => {
+    try {
+      const user = resolveUserFromRequest(req);
+      if (!user) return res.status(401).json({ error: 'Autenticação obrigatória.' });
+
+      const order = billingOrders.find((o) => o.id === req.params.id);
+      if (!order) return res.status(404).json({ error: 'Cobrança não encontrada.' });
+      if (order.user_id !== user.id) return res.status(403).json({ error: 'Acesso negado.' });
+
+      return res.json({ order });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // =========================================================================
   // 10. SCRAPER & CLOUDFLARE BROWSER SETTINGS (/api/v1/scraper/settings)
   // =========================================================================
 
@@ -1614,18 +1816,26 @@ async function startServer() {
   // 11. VITE MIDDLEWARE / SPA STATIC HANDLER
   // =========================================================================
 
+  // Servir arquivos estáticos do frontend (build do Vite) em produção.
+  // No Cloudflare Worker, o wrangler.jsonc já mapeia a pasta "dist" via binding "ASSETS";
+  // aqui também servimos como fallback para execução local direta.
   if (process.env.NODE_ENV === 'production' && fs.existsSync(path.resolve(__dirname, 'dist'))) {
     app.use(express.static(path.resolve(__dirname, 'dist')));
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.resolve(__dirname, 'dist/index.html'));
     });
-  } else {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
   }
+
+  return app;
+}
+
+/**
+ * Inicia o servidor HTTP local (Express). Apenas para desenvolvimento/local.
+ * Não usado pelo Cloudflare Worker (que expõe createApp via worker-entry).
+ */
+async function startServer() {
+  const app = createApp();
+  const PORT = 3000;
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n============================================================`);
@@ -1635,7 +1845,12 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('[MapScrape Pro] Falha crítica ao iniciar o servidor:', err);
-  process.exit(1);
-});
+// Só inicia o servidor quando executado diretamente (não quando importado pelo Worker).
+if (import.meta.main) {
+  startServer().catch((err) => {
+    console.error('[MapScrape Pro] Falha crítica ao iniciar o servidor:', err);
+    process.exit(1);
+  });
+}
+
+export { createApp };

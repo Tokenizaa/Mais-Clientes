@@ -10,7 +10,7 @@
     "APP_URL": "https://mapscrape-pro.workers.dev",
     "NODE_ENV": "production",
     "SUPABASE_URL": "https://ifkqrtjhdnolkuucgbpb.supabase.co",
-    "BROWSER_WS_ENDPOINT": ""
+    "BROWSER_WS_ENDPOINT": "wss://production-sfo.browserless.io?token=2VVroUWpSKqzBFvd58e7b22ca5632297159b64db4343460ba"
   },
 
   // Observabilidade

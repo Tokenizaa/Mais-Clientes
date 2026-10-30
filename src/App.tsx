@@ -45,7 +45,6 @@ import { apiFetch, getAuthToken } from './utils/api.ts';
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<ScreenTab>('dashboard');
-  const [apiKeyInput, setApiKeyInput] = useState('');
   const [hasApiKey, setHasApiKey] = useState(() => Boolean(window.sessionStorage.getItem('mapscrape_session_token')));
   const [authUser, setAuthUser] = useState<{ id: string; email: string; name: string; role: 'admin' | 'user' } | null>(() => {
     try { 
@@ -53,7 +52,6 @@ export default function App() {
       return userJson ? JSON.parse(userJson) : null; 
     } catch { return null; }
   });
-  const [apiKeyError, setApiKeyError] = useState('');
 
   useEffect(() => {
     // Initialize Supabase Auth session if client available
@@ -67,12 +65,17 @@ export default function App() {
       
       if (data?.session?.user?.id) {
         const userId = data.session.user.id;
+        const accessToken = data.session.access_token;
         window.sessionStorage.setItem('mapscrape_user_id', userId);
+        // Armazena o JWT de sessão Supabase para uso nas rotas v1 (/api/v1/jobs, etc.)
+        if (accessToken) {
+          window.sessionStorage.setItem('mapscrape_session_token', accessToken);
+        }
         
         // Look up the user profile in our database
         try {
           const profileResponse = await apiFetch('/api/auth/me', {
-            headers: { Authorization: `Bearer ${data.session.access_token}` },
+            headers: { Authorization: `Bearer ${accessToken}` },
             cache: 'no-store',
           });
           
@@ -110,15 +113,19 @@ export default function App() {
       
       if (session?.user?.id) {
         const userId = session.user.id;
+        const accessToken = session.access_token;
         window.sessionStorage.setItem('mapscrape_user_id', userId);
-        
+        if (accessToken) {
+          window.sessionStorage.setItem('mapscrape_session_token', accessToken);
+        }
+
         // Fetch user profile
         try {
           const profileResponse = await apiFetch('/api/auth/me', {
-            headers: { Authorization: `Bearer ${session.access_token}` },
+            headers: { Authorization: `Bearer ${accessToken}` },
             cache: 'no-store',
           });
-          
+
           if (!profileResponse.ok) {
             // Fall back
           } else {
@@ -126,7 +133,6 @@ export default function App() {
             if (profile.user) {
               setAuthUser(profile.user);
               window.sessionStorage.setItem('mapscrape_user', JSON.stringify(profile.user));
-              window.sessionStorage.setItem('mapscrape_session_token', session.access_token);
             }
           }
         } catch (err) {
@@ -147,42 +153,11 @@ export default function App() {
     };
   }, [supabase]);
 
-  const [isConnectingApi, setIsConnectingApi] = useState(false);
-
-  const handleConnectApiKey = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const key = apiKeyInput.trim();
-    if (!key) return;
-    setIsConnectingApi(true);
-    setApiKeyError('');
-    window.sessionStorage.setItem('mapscrape_api_key', key);
-    try {
-      const response = await apiFetch('/api/v1/jobs', { cache: 'no-store' });
-      if (!response.ok) throw new Error(response.status === 401 ? 'Chave de API inválida ou revogada.' : `Falha de autenticação (HTTP ${response.status}).`);
-      setHasApiKey(true);
-      setApiKeyInput('');
-      // Load history and places after connecting
-      // These will be loaded below
-    } catch (error) {
-      window.sessionStorage.removeItem('mapscrape_api_key');
-      setHasApiKey(false);
-      setApiKeyError(error instanceof Error ? error.message : 'Não foi possível validar a chave.');
-    } finally {
-      setIsConnectingApi(false);
-    }
-  };
-
   const handleDisconnectApiKey = () => {
-    window.sessionStorage.removeItem('mapscrape_api_key');
     window.sessionStorage.removeItem('mapscrape_session_token');
     window.sessionStorage.removeItem('mapscrape_user');
     window.sessionStorage.removeItem('mapscrape_user_id');
     setAuthUser(null);
-    setHasApiKey(false);
-    setJobs([]);
-    setPlaces([]);
-    setTotalPlaces(0);
-    setApiKeyInput('');
   };
 
   const handleAuthenticated = (token: string, user: { id: string; email: string; name: string; role: 'admin' | 'user' }) => {
@@ -191,7 +166,6 @@ export default function App() {
     window.sessionStorage.setItem('mapscrape_user', JSON.stringify(user));
     setAuthUser(user);
     setHasApiKey(true);
-    setApiKeyError('');
   };
 
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState<boolean>(false);

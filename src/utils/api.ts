@@ -276,14 +276,32 @@ export function getCloudflareProxyHeaders(apiToken?: string): Record<string, str
 }
 
 /**
- * Obtém o token de autenticação atual armazenado na sessão
+ * Obtém o token de autenticação atual armazenado na sessão.
+ *
+ * Retorna apenas o token de sessão Supabase (JWT). Chaves de API
+ * (`mapscrape_api_key`) NÃO são usadas para autenticação nas rotas v1,
+ * pois o Worker remoto (`resolveUser` em worker-entry.ts) não as valida —
+ * aceita somente JWT do Supabase (`sb.auth.getUser`) ou tokens de memória
+ * no formato `sess_<userId>_<nonce>`.
  */
 export function getAuthToken(): string | null {
   if (typeof window === 'undefined') return null;
-  return (
-    window.sessionStorage.getItem('mapscrape_api_key') ||
-    window.sessionStorage.getItem('mapscrape_session_token')
-  );
+  return window.sessionStorage.getItem('mapscrape_session_token');
+}
+
+/**
+ * Obtém o access_token de sessão diretamente do cliente Supabase JS.
+ * Útil como fonte da verdade quando o token em sessionStorage pode estar
+ * desatualizado ou quando se deseja garantir um JWT válido do Supabase.
+ */
+export async function getSupabaseSessionToken(supabaseClient: any): Promise<string | null> {
+  if (typeof window === 'undefined' || !supabaseClient) return null;
+  try {
+    const { data } = await supabaseClient.auth.getSession();
+    return data?.session?.access_token ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
