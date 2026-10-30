@@ -19,9 +19,14 @@
 
 import { hashPassword, verifyPassword } from './server/auth-crypto';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import puppeteer, { Browser, Page } from 'puppeteer';
 import { PlaceRecord, ScrapeJob } from './shared/types';
 import { extractPlaceDetails } from './server/scraper/extractor';
+import {
+  cleanText, normalizeAddress, normalizePhone, normalizeWebsite, normalizeCategory,
+  normalizeRating, normalizeReviewCount, normalizePriceRange, normalizeBusinessStatus,
+  extractCoordinates, parseAddressComponents, extractSourcePlaceId,
+} from './server/scraper/normalizer';
+import { SELECTORS } from './server/scraper/selectors';
 
 // Tipos locais do Cloudflare Workers (evita conflitos com o build do frontend)
 interface ExecutionContext {
@@ -29,8 +34,13 @@ interface ExecutionContext {
   passThroughOnException(): void;
 }
 
+interface QueueMessage<T> { body: T; ack(): void; retry(options?: { delaySeconds?: number }): void; }
+interface MessageBatch<T> { queue: string; messages: QueueMessage<T>[]; }
+interface QueueBinding<T> { send(message: T): Promise<void>; }
+
 interface ExportedHandler<Env = any> {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response>;
+  queue?(batch: MessageBatch<any>, env: Env): Promise<void>;
 }
 
 interface Fetcher {
@@ -39,7 +49,8 @@ interface Fetcher {
 
 interface Env {
   ADMIN_SEED_PASSWORD?: string;
-  BROWSER_WS_ENDPOINT?: string;
+  BROWSERLESS_TOKEN?: string;
+  SCRAPE_QUEUE?: QueueBinding<ScrapeQueueMessage>;
   PAYMENT_WEBHOOK_SECRET?: string;
   SUPABASE_URL?: string;
   SUPABASE_ANON_KEY?: string;
@@ -404,212 +415,195 @@ async function resolveUser(
 // Scraping real (adaptado do server.ts para Cloudflare Workers)
 // ============================================================================
 
-const activeScrapeJobs = new Map<string, { cancel: () => void }>();
+interface ScrapeQueueMessage {
+  jobId: string;
+  segment: string;
+  location: string;
+  limit: number;
+  userId: string;
+}
 
-async function connectScrapeBrowser(wsEndpoint: string): Promise<Browser> {
-  if (wsEndpoint) {
-    try {
-      console.log(`[Scraper] Conectando ao Chromium remoto: ${wsEndpoint.replace(/:[^:]*@/, ':***@')}`);
-      return await puppeteer.connect({
-        browserWSEndpoint: wsEndpoint,
-        protocolTimeout: 45000,
-      });
-    } catch (err: any) {
-      console.warn(`[Scraper] Falha ao conectar ao Chromium remoto (${err?.message}).`);
-    }
-  }
-  throw new Error('BROWSER_WS_ENDPOINT não configurado. O scraping real requer Cloudflare Browser Rendering.');
+function buildBrowserlessScrapeCode(): string {
+  // Serializa o extrator e seus helpers para executar a mesma lógica de captura
+  // dentro da sessão Puppeteer gerenciada pelo Browserless.
+  const helpers = [
+    'const SELECTORS = ' + JSON.stringify(SELECTORS) + ';',
+    'const cleanText = ' + cleanText.toString() + ';',
+    'const normalizeAddress = ' + normalizeAddress.toString() + ';',
+    'const normalizePhone = ' + normalizePhone.toString() + ';',
+    'const normalizeWebsite = ' + normalizeWebsite.toString() + ';',
+    'const normalizeCategory = ' + normalizeCategory.toString() + ';',
+    'const normalizeRating = ' + normalizeRating.toString() + ';',
+    'const normalizeReviewCount = ' + normalizeReviewCount.toString() + ';',
+    'const normalizePriceRange = ' + normalizePriceRange.toString() + ';',
+    'const normalizeBusinessStatus = ' + normalizeBusinessStatus.toString() + ';',
+    'const extractCoordinates = ' + extractCoordinates.toString() + ';',
+    'const parseAddressComponents = ' + parseAddressComponents.toString() + ';',
+    'const extractSourcePlaceId = ' + extractSourcePlaceId.toString() + ';',
+    'const extractPlaceDetails = ' + extractPlaceDetails.toString() + ';',
+  ].join('\n');
+
+  const runner = [
+    'export default async ({ page, context }) => {',
+    '  const { jobId, segment, location, limit } = context;',
+    '  const searchQuery = (String(segment || "") + " " + String(location || "")).trim();',
+    '  const searchUrl = "https://www.google.com/maps/search/" + encodeURIComponent(searchQuery);',
+    '  await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");',
+    '  await page.setViewport({ width: 1280, height: 900 });',
+    '  await page.setExtraHTTPHeaders({ "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" });',
+    '  await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });',
+    '  await new Promise((resolve) => setTimeout(resolve, 1800));',
+    '  await page.evaluate(() => {',
+    '    const buttons = Array.from(document.querySelectorAll("button"));',
+    '    const consent = buttons.find((button) => /aceitar|concordo|accept all|i agree/i.test(button.innerText || ""));',
+    '    if (consent) consent.click();',
+    '  }).catch(() => {});',
+    '  const placeUrls = new Set();',
+    '  let previousCount = 0;',
+    '  let stagnantRounds = 0;',
+    '  for (let round = 0; round < 30 && placeUrls.size < limit && stagnantRounds < 6; round += 1) {',
+    '    const links = await page.$$eval("a[href*=\\\"/maps/place/\\\"]", (anchors) => anchors.map((anchor) => anchor.href).filter((href) => href && href.includes("/maps/place/"))).catch(() => []);',
+    '    for (const href of links) { if (placeUrls.size >= limit) break; placeUrls.add(href); }',
+    '    if (placeUrls.size === previousCount) stagnantRounds += 1; else { stagnantRounds = 0; previousCount = placeUrls.size; }',
+    '    if (placeUrls.size >= limit || stagnantRounds >= 6) break;',
+    '    await page.evaluate(() => {',
+    '      const feed = document.querySelector("div[role=\\\"feed\\\"]") || document.querySelector("div.m6QErb[aria-label]") || document.querySelector("div.TFQHme");',
+    '      if (feed) feed.scrollTop = feed.scrollHeight; else window.scrollTo(0, document.body.scrollHeight);',
+    '    }).catch(() => {});',
+    '    await new Promise((resolve) => setTimeout(resolve, 1100));',
+    '  }',
+    '  const urls = Array.from(placeUrls).slice(0, limit);',
+    '  const places = [];',
+    '  const errors = [];',
+    '  for (const placeUrl of urls) {',
+    '    try {',
+    '      await page.goto(placeUrl, { waitUntil: "domcontentloaded", timeout: 30000 });',
+    '      await new Promise((resolve) => setTimeout(resolve, 900));',
+    '      const place = await extractPlaceDetails(page, jobId, placeUrl);',
+    '      if (!place.city && String(location).includes(",")) {',
+    '        const parts = String(location).split(","); place.city = parts[0].trim(); if (parts[1]) place.state = parts[1].trim();',
+    '      } else if (!place.city) place.city = String(location);',
+    '      places.push(place);',
+    '    } catch (error) { errors.push({ url: placeUrl, message: String(error && error.message || error).slice(0, 500) }); }',
+    '  }',
+    '  return { data: { totalFound: placeUrls.size, places, errors }, type: "application/json" };',
+    '};',
+  ].join('\n');
+  return helpers + '\n' + runner;
 }
 
 async function updateJobSupabase(env: Env, userId: string, jobId: string, updates: any): Promise<void> {
-  const { error } = await supabaseFetch(env, 'PATCH', `searches?id=eq.${encodeURIComponent(jobId)}&user_id=eq.${encodeURIComponent(userId)}`, updates);
-  if (error) throw new Error(`Falha ao atualizar job ${jobId}: ${error.message}`);
+  const { error } = await supabaseFetch(env, 'PATCH', \`searches?id=eq.\${encodeURIComponent(jobId)}&user_id=eq.\${encodeURIComponent(userId)}\`, updates);
+  if (error) throw new Error(\`Falha ao atualizar job \${jobId}: \${error.message}\`);
 }
 
 async function insertPlaceSupabase(env: Env, place: any): Promise<void> {
   const { error } = await supabaseFetch(env, 'POST', 'places', place);
-  if (error) throw new Error(`Falha ao persistir estabelecimento: ${error.message}`);
+  if (error) throw new Error(\`Falha ao persistir estabelecimento: \${error.message}\`);
 }
 
-async function executeScrapeJob(
-  jobId: string,
-  segment: string,
-  location: string,
-  limit: number,
-  userId: string,
-  wsEndpoint: string,
-  env: Env
-) {
-  let activeBrowser: Browser | null = null;
-
-  activeScrapeJobs.set(jobId, {
-    cancel: () => {
-      if (activeBrowser) {
-        activeBrowser.close().catch(() => {});
-      }
-    },
-  });
-
-  const setJobStatus = async (updates: any) => {
-    await updateJobSupabase(env, userId, jobId, updates);
-  };
+async function executeScrapeJob(job: ScrapeQueueMessage, env: Env): Promise<void> {
+  const { jobId, segment, location, limit, userId } = job;
+  const token = env.BROWSERLESS_TOKEN;
+  const setJobStatus = async (updates: any) => updateJobSupabase(env, userId, jobId, updates);
 
   try {
-    const searchQuery = `${segment} ${location}`.trim();
-    const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(searchQuery)}`;
+    if (!token) throw new Error('BROWSERLESS_TOKEN não configurado como secret no Cloudflare.');
+    await setJobStatus({ status: 'running', current_step: 'Conectando ao Browserless via HTTPS...', status_message: 'Execução da coleta iniciada.' });
 
-    await setJobStatus({ status: 'running', current_step: 'Conectando ao navegador...' });
-
-    activeBrowser = await connectScrapeBrowser(wsEndpoint);
-    const searchPage = await activeBrowser.newPage();
-    await searchPage.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-    await searchPage.setViewport({ width: 1280, height: 900 });
-    await searchPage.setExtraHTTPHeaders({
-      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    const endpoint = 'https://production-sfo.browserless.io/function?timeout=600000';
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        code: buildBrowserlessScrapeCode(),
+        context: { jobId, segment, location, limit },
+      }),
+      signal: AbortSignal.timeout(610000),
     });
 
-    await setJobStatus({ current_step: `Navegando no Google Maps para: "${searchQuery}"...` });
-
-    await searchPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await new Promise((r) => setTimeout(r, 2000));
-
-    // Handle Google consent banner
-    await searchPage.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button'));
-      const consentBtn = btns.find((b) =>
-        /aceitar|concordo|accept all|i agree/i.test(b.innerText || '')
-      );
-      if (consentBtn) consentBtn.click();
-    }).catch(() => {});
-
-    const placeUrls = new Set<string>();
-    let previousCount = 0;
-    let stagnantRounds = 0;
-
-    if (searchPage.url().includes('/maps/place/')) {
-      placeUrls.add(searchPage.url());
+    if (!response.ok) {
+      const responseText = (await response.text()).slice(0, 800);
+      const safeMessage = response.status === 401 || response.status === 403
+        ? 'Browserless recusou a autenticação. Verifique o secret BROWSERLESS_TOKEN.'
+        : 'Browserless respondeu HTTP ' + response.status + ': ' + responseText;
+      throw new Error(safeMessage);
     }
 
-    await setJobStatus({ current_step: 'Buscando fichas comerciais na página de resultados...' });
-
-    while (placeUrls.size < limit && stagnantRounds < 6) {
-      const links: string[] = await searchPage
-        .$$eval('a[href*="/maps/place/"]', (anchors) =>
-          anchors
-            .map((a) => (a as HTMLAnchorElement)?.href)
-            .filter((href): href is string => Boolean(href) && href.includes('/maps/place/'))
-        )
-        .catch(() => []);
-
-      for (const url of links) {
-        if (placeUrls.size >= limit) break;
-        placeUrls.add(url);
-      }
-
-      await setJobStatus({ total_found: placeUrls.size, current_step: `Identificados ${placeUrls.size} estabelecimentos...` });
-
-      if (placeUrls.size >= limit) break;
-
-      await searchPage.evaluate(() => {
-        const feed =
-          document.querySelector('div[role="feed"]') ||
-          document.querySelector('div.m6QErb[aria-label]') ||
-          document.querySelector('div.TFQHme');
-        if (feed) {
-          (feed as HTMLElement).scrollTop = feed.scrollHeight;
-        } else {
-          window.scrollTo(0, document.body.scrollHeight);
-        }
-      }).catch(() => {});
-
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-
-      if (placeUrls.size === previousCount) {
-        stagnantRounds += 1;
-      } else {
-        stagnantRounds = 0;
-        previousCount = placeUrls.size;
-      }
-    }
-
-    await searchPage.close().catch(() => {});
-
-    if (placeUrls.size === 0) {
-      await setJobStatus({
-        status: 'failed',
-        status_message: 'Nenhum estabelecimento encontrado no Google Maps para esta busca.',
-        current_step: 'Sem resultados',
-        total_errors: 1,
-      });
-      return;
-    }
-
-    let collectedCount = 0;
-
-    for (const placeUrl of placeUrls) {
-      if (collectedCount >= limit) break;
-
-      let detailPage: Page | null = null;
-      try {
-        detailPage = await activeBrowser!.newPage();
-        await detailPage.setUserAgent(
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        );
-        await detailPage.setViewport({ width: 1280, height: 900 });
-        await detailPage.setExtraHTTPHeaders({
-          'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        });
-
-        await detailPage.goto(placeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await new Promise((resolve) => setTimeout(resolve, 1200));
-
-        const place = await extractPlaceDetails(detailPage, jobId, placeUrl);
-
-        if (!place.city && location.includes(',')) {
-          const parts = location.split(',');
-          place.city = parts[0].trim();
-          if (parts[1]) place.state = parts[1].trim();
-        } else if (!place.city) {
-          place.city = location;
-        }
-
-        await insertPlaceSupabase(env, place);
-        collectedCount += 1;
-
-        await setJobStatus({
-          total_collected: collectedCount,
-          current_step: `Coletado (${collectedCount}/${Math.min(limit, placeUrls.size)}): ${place.name || 'Estabelecimento'}`,
-        });
-      } catch (extractErr: any) {
-        console.error(`Erro ao coletar ficha ${placeUrl}:`, extractErr.message);
-      } finally {
-        if (detailPage) await detailPage.close().catch(() => {});
-      }
-    }
+    const result: any = await response.json();
+    const payload = result?.data ?? result;
+    const places: any[] = Array.isArray(payload?.places) ? payload.places : [];
+    const errors: any[] = Array.isArray(payload?.errors) ? payload.errors : [];
+    const totalFound = Number.isFinite(Number(payload?.totalFound)) ? Number(payload.totalFound) : places.length;
 
     await setJobStatus({
-      status: collectedCount > 0 ? 'completed' : 'failed',
-      status_message:
-        collectedCount > 0
-          ? `Coleta concluída com sucesso! ${collectedCount} estabelecimentos extraídos.`
-          : 'Nenhum estabelecimento pôde ser extraído.',
-      current_step: collectedCount > 0 ? 'Concluído' : 'Falha',
+      total_found: totalFound,
+      total_errors: errors.length,
+      current_step: 'Persistindo ' + places.length + ' fichas extraídas...',
+    });
+
+    let collectedCount = 0;
+    let persistenceErrors = 0;
+    for (const place of places) {
+      try {
+        await insertPlaceSupabase(env, place);
+        collectedCount += 1;
+        await setJobStatus({
+          total_collected: collectedCount,
+          current_step: 'Coletado (' + collectedCount + '/' + places.length + '): ' + (place.name || 'Estabelecimento'),
+        });
+      } catch (error: any) {
+        persistenceErrors += 1;
+        console.error('[Scraper] Falha ao persistir ficha:', String(error?.message || error).slice(0, 300));
+      }
+    }
+
+    const totalErrors = errors.length + persistenceErrors;
+    const completed = collectedCount > 0 && totalErrors === 0;
+    const partial = collectedCount > 0 && totalErrors > 0;
+    await setJobStatus({
+      status: completed ? 'completed' : partial ? 'partial' : 'failed',
+      status_message: completed
+        ? 'Coleta concluída. ' + collectedCount + ' estabelecimentos persistidos.'
+        : partial
+          ? 'Coleta parcial: ' + collectedCount + ' estabelecimentos persistidos e ' + totalErrors + ' erros.'
+          : 'Nenhum estabelecimento foi persistido. Erros: ' + totalErrors + '.',
+      current_step: completed ? 'Concluído' : partial ? 'Concluído parcialmente' : 'Falha',
+      total_found: totalFound,
+      total_collected: collectedCount,
+      total_errors: totalErrors,
       completed_at: new Date().toISOString(),
     });
   } catch (error: any) {
-    await setJobStatus({
-      status: 'failed',
-      status_message: `Erro durante a execução da coleta: ${error?.message || 'Falha desconhecida'}`,
-      current_step: 'Falha',
-      total_errors: 1,
-    });
-  } finally {
-    if (activeBrowser) {
-      await activeBrowser.close().catch(() => {});
+    const message = String(error?.message || 'Falha desconhecida').slice(0, 700);
+    console.error('[Scraper] Job ' + jobId + ' falhou: ' + message);
+    try {
+      await setJobStatus({
+        status: 'failed',
+        status_message: 'Erro durante a execução da coleta: ' + message,
+        current_step: 'Falha',
+        total_errors: 1,
+        completed_at: new Date().toISOString(),
+      });
+    } catch (persistError: any) {
+      console.error('[Scraper] Não foi possível registrar falha do job ' + jobId + ': ' + String(persistError?.message || persistError));
     }
-    activeScrapeJobs.delete(jobId);
+  }
+}
+
+async function consumeScrapeQueue(batch: MessageBatch<ScrapeQueueMessage>, env: Env): Promise<void> {
+  for (const message of batch.messages) {
+    try {
+      await executeScrapeJob(message.body, env);
+      message.ack();
+    } catch (error) {
+      console.error('[Scraper] Erro não tratado no consumer:', error);
+      message.retry({ delaySeconds: 30 });
+    }
   }
 }
 
@@ -790,8 +784,16 @@ async function handleJobs(req: Request, url: URL, env: Env, ctx: ExecutionContex
           created_at: new Date().toISOString(),
         }, { single: true });
         if (!error && data) {
-          const wsEndpoint = env.BROWSER_WS_ENDPOINT ?? '';
-          ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint, env));
+          if (!env.SCRAPE_QUEUE) {
+            await updateJobSupabase(env, user.id, jobId, { status: 'failed', status_message: 'Fila SCRAPE_QUEUE não configurada no Cloudflare.', current_step: 'Falha de configuração', total_errors: 1, completed_at: new Date().toISOString() });
+            return errorResponse('Fila de coleta não configurada. Configure a Cloudflare Queue mapscrape-jobs.', 503);
+          }
+          try {
+            await env.SCRAPE_QUEUE.send({ jobId, segment: String(segment).trim(), location: String(location).trim(), limit: numLimit, userId: user.id });
+          } catch (queueError: any) {
+            await updateJobSupabase(env, user.id, jobId, { status: 'failed', status_message: 'Falha ao agendar coleta: ' + String(queueError?.message || queueError), current_step: 'Falha ao agendar', total_errors: 1, completed_at: new Date().toISOString() });
+            return errorResponse('Não foi possível agendar a coleta na fila.', 503);
+          }
           return jsonResponse({ data: { jobId, job: Array.isArray(data) ? data[0] : data }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
         }
       } catch {}
@@ -815,8 +817,24 @@ async function handleJobs(req: Request, url: URL, env: Env, ctx: ExecutionContex
       created_at: new Date().toISOString(),
     };
     memoryState.jobs.unshift(newJob);
-    const wsEndpoint = env.BROWSER_WS_ENDPOINT ?? '';
-    ctx.waitUntil(executeScrapeJob(jobId, String(segment).trim(), String(location).trim(), numLimit, user.id, wsEndpoint, env));
+    if (!env.SCRAPE_QUEUE) {
+      newJob.status = 'failed';
+      newJob.status_message = 'Fila SCRAPE_QUEUE não configurada no Cloudflare.';
+      newJob.current_step = 'Falha de configuração';
+      newJob.total_errors = 1;
+      newJob.completed_at = new Date().toISOString();
+      return errorResponse('Fila de coleta não configurada. Configure a Cloudflare Queue mapscrape-jobs.', 503);
+    }
+    try {
+      await env.SCRAPE_QUEUE.send({ jobId, segment: String(segment).trim(), location: String(location).trim(), limit: numLimit, userId: user.id });
+    } catch (queueError: any) {
+      newJob.status = 'failed';
+      newJob.status_message = 'Falha ao agendar coleta: ' + String(queueError?.message || queueError);
+      newJob.current_step = 'Falha ao agendar';
+      newJob.total_errors = 1;
+      newJob.completed_at = new Date().toISOString();
+      return errorResponse('Não foi possível agendar a coleta na fila.', 503);
+    }
     return jsonResponse({ data: { jobId, job: newJob }, jobId, message: 'Coleta agendada com sucesso.' }, 201);
   }
 
@@ -899,12 +917,12 @@ async function handleScraperSettings(req: Request, url: URL, env: Env): Promise<
   const method = req.method;
 
   if (path === '/api/v1/scraper/settings' && method === 'GET') {
-    const hasRemoteEndpoint = Boolean(env.BROWSER_WS_ENDPOINT);
+    const isConfigured = Boolean(env.BROWSERLESS_TOKEN);
     return jsonResponse({
-      engine: hasRemoteEndpoint ? 'cloudflare_remote' : 'unconfigured',
-      hasRemoteEndpoint,
-      status: hasRemoteEndpoint ? 'configured' : 'unconfigured',
-      description: hasRemoteEndpoint ? 'Endpoint remoto configurado' : 'Mecanismo de navegador não configurado',
+      engine: isConfigured ? 'browserless_http' : 'unconfigured',
+      hasRemoteEndpoint: isConfigured,
+      status: isConfigured ? 'configured' : 'unconfigured',
+      description: isConfigured ? 'Browserless HTTP configurado' : 'Secret BROWSERLESS_TOKEN não configurado',
     });
   }
 
@@ -1069,10 +1087,6 @@ export default {
     // Expor variáveis de ambiente como globais (para acesso nos helpers)
     const adminPassword = env.ADMIN_SEED_PASSWORD ?? '';
     (globalThis as any).ADMIN_SEED_PASSWORD = adminPassword;
-    (globalThis as any).PAYMENT_WEBHOOK_SECRET = env.PAYMENT_WEBHOOK_SECRET ?? '';
-    (globalThis as any).SUPABASE_URL = env.SUPABASE_URL ?? '';
-    (globalThis as any).SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? '';
-    (globalThis as any).SUPABASE_ANON_KEY = env.SUPABASE_ANON_KEY ?? '';
 
     // Garante seed e senha do admin a cada requisição (env só está disponível no fetch)
     ensureMemorySeed(adminPassword);
@@ -1094,5 +1108,8 @@ export default {
       '<html><body><h1>MapScrape Pro — Worker Ativo</h1><p>API disponível em /api/*</p></body></html>',
       { status: 200, headers: { 'Content-Type': 'text/html' } }
     );
+  },
+  async queue(batch: MessageBatch<ScrapeQueueMessage>, env: Env): Promise<void> {
+    await consumeScrapeQueue(batch, env);
   },
 } satisfies ExportedHandler<Env>;
